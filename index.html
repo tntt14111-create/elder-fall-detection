@@ -1,0 +1,464 @@
+
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI老人防跌監測系統</title>
+
+<style>
+body {
+  font-family: Arial, sans-serif;
+  background: #f0f4f8;
+  text-align: center;
+  margin: 0;
+  padding: 15px;
+}
+h2 { color: #234; }
+.container {
+  max-width: 650px;
+  margin: auto;
+  background: white;
+  padding: 15px;
+  border-radius: 15px;
+}
+video, canvas {
+  width: 100%;
+  border-radius: 10px;
+}
+.camera {
+  position: relative;
+  width: 100%;
+}
+canvas {
+  position: absolute;
+  left: 0;
+  top: 0;
+}
+button {
+  padding: 12px 15px;
+  margin: 5px;
+  border: 0;
+  border-radius: 8px;
+  background: #2878c8;
+  color: white;
+  font-size: 16px;
+}
+.stop { background: #d9534f; }
+.status {
+  padding: 12px;
+  margin: 12px 0;
+  border-radius: 8px;
+  background: #e8f5e9;
+  font-weight: bold;
+}
+.warning {
+  background: #ffdddd;
+  color: #c00;
+}
+#events {
+  text-align: left;
+  font-size: 14px;
+}
+</style>
+</head>
+
+<body>
+<div class="container">
+
+<h2>AI 高齡者防跌監測系統</h2>
+<p>利用手機攝影機進行人體姿勢辨識與疑似跌倒提醒</p>
+
+<div class="camera">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="canvas"></canvas>
+</div>
+
+<div id="status" class="status">尚未開始監測</div>
+
+<button onclick="startSystem()">開始監測</button>
+<button class="stop" onclick="stopSystem()">停止監測</button>
+<button onclick="switchCamera()">切換鏡頭</button>
+<button onclick="exportCSV()">下載紀錄 CSV</button>
+
+<p id="angle">身體傾斜角度：--</p>
+<p id="count">疑似跌倒次數：0</p>
+
+<h3>監測事件紀錄</h3>
+<div id="events">目前沒有紀錄</div>
+
+</div>
+
+<script type="module">
+
+import {
+  PoseLandmarker,
+  FilesetResolver
+} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const statusBox = document.getElementById("status");
+
+let poseLandmarker = null;
+let stream = null;
+let running = false;
+let cameraMode = "environment";
+let fallCount = 0;
+let events = [];
+let fallStart = null;
+let lastAlert = 0;
+let animationId = null;
+
+const MODEL_URL =
+"https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+
+async function loadAI() {
+
+  statusBox.textContent = "正在載入 AI 人體辨識模型...";
+
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+  );
+
+  poseLandmarker = await PoseLandmarker.createFromOptions(
+    vision,
+    {
+      baseOptions: {
+        modelAssetPath: MODEL_URL,
+        delegate: "CPU"
+      },
+      runningMode: "VIDEO",
+      numPoses: 1
+    }
+  );
+}
+
+async function startSystem() {
+
+  try {
+
+    if (running) return;
+
+    statusBox.textContent = "正在啟動攝影機...";
+
+    if (!navigator.mediaDevices ||
+        !navigator.mediaDevices.getUserMedia) {
+      throw new Error("瀏覽器不支援攝影機，請使用 HTTPS 網址及最新版 Chrome。");
+    }
+
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: {
+        facingMode: cameraMode,
+        width: { ideal: 640 },
+        height: { ideal: 480 }
+      }
+    });
+
+    video.srcObject = stream;
+
+    await video.play();
+
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+
+    if (!poseLandmarker) {
+      await loadAI();
+    }
+
+    running = true;
+    statusBox.textContent = "監測中，請保持攝影機可以拍攝全身。";
+
+    detectPose();
+
+  } catch (error) {
+
+    console.error(error);
+
+    statusBox.textContent =
+      "啟動失敗：" + error.name + " - " + error.message;
+
+    stopCamera();
+
+  }
+}
+
+function detectPose() {
+
+  if (!running) return;
+
+  if (video.readyState >= 2) {
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    const now = performance.now();
+
+    const result = poseLandmarker.detectForVideo(video, now);
+
+    if (result.landmarks && result.landmarks.length > 0) {
+
+      const landmarks = result.landmarks[0];
+
+      drawSkeleton(landmarks);
+
+      analyzeFall(landmarks);
+
+    } else {
+
+      statusBox.textContent = "尚未偵測到人體，請調整攝影機位置。";
+      fallStart = null;
+
+    }
+
+  }
+
+  animationId = requestAnimationFrame(detectPose);
+}
+
+function drawSkeleton(points) {
+
+  const connections = [
+    [11,12], [11,13], [13,15],
+    [12,14], [14,16],
+    [11,23], [12,24], [23,24],
+    [23,25], [25,27], [24,26], [26,28],
+    [27,31], [28,32]
+  ];
+
+  ctx.strokeStyle = "#00e676";
+  ctx.lineWidth = 3;
+
+  connections.forEach(([a,b]) => {
+
+    const p1 = points[a];
+    const p2 = points[b];
+
+    if (!p1 || !p2 ||
+        p1.visibility < 0.5 ||
+        p2.visibility < 0.5) return;
+
+    ctx.beginPath();
+    ctx.moveTo(p1.x * canvas.width, p1.y * canvas.height);
+    ctx.lineTo(p2.x * canvas.width, p2.y * canvas.height);
+    ctx.stroke();
+
+  });
+
+  points.forEach(p => {
+
+    if (p.visibility < 0.5) return;
+
+    ctx.beginPath();
+    ctx.arc(
+      p.x * canvas.width,
+      p.y * canvas.height,
+      4, 0, Math.PI * 2
+    );
+    ctx.fillStyle = "#ffeb3b";
+    ctx.fill();
+
+  });
+}
+
+function analyzeFall(p) {
+
+  const leftShoulder = p[11];
+  const rightShoulder = p[12];
+  const leftHip = p[23];
+  const rightHip = p[24];
+
+  if ([leftShoulder, rightShoulder, leftHip, rightHip]
+      .some(point => !point || point.visibility < 0.5)) {
+    fallStart = null;
+    return;
+  }
+
+  const shoulderX = (leftShoulder.x + rightShoulder.x) / 2;
+  const shoulderY = (leftShoulder.y + rightShoulder.y) / 2;
+
+  const hipX = (leftHip.x + rightHip.x) / 2;
+  const hipY = (leftHip.y + rightHip.y) / 2;
+
+  const dx = shoulderX - hipX;
+  const dy = shoulderY - hipY;
+
+  const angle =
+    Math.abs(Math.atan2(dx, -dy) * 180 / Math.PI);
+
+  document.getElementById("angle").textContent =
+    "身體傾斜角度：" + angle.toFixed(1) + "°";
+
+  const horizontal = Math.abs(dx) > Math.abs(dy);
+  const suspectedFall = angle > 55 || horizontal;
+
+  if (suspectedFall) {
+
+    if (!fallStart) {
+      fallStart = Date.now();
+    }
+
+    const duration = Date.now() - fallStart;
+
+    if (duration >= 1500 && Date.now() - lastAlert > 5000) {
+
+      triggerAlert();
+
+    } else {
+
+      statusBox.textContent = "注意：偵測到身體明顯傾斜，持續觀察中。";
+
+    }
+
+  } else {
+
+    fallStart = null;
+    statusBox.textContent = "監測中，暫無疑似跌倒情形。";
+
+  }
+}
+
+function triggerAlert() {
+
+  lastAlert = Date.now();
+  fallCount++;
+
+  document.getElementById("count").textContent =
+    "疑似跌倒次數：" + fallCount;
+
+  statusBox.textContent = "⚠️ 疑似跌倒！請立即確認長者狀況！";
+  statusBox.classList.add("warning");
+
+  const event = {
+    time: new Date().toLocaleString(),
+    message: "疑似跌倒"
+  };
+
+  events.push(event);
+  updateEvents();
+
+  playAlarm();
+
+  fallStart = null;
+
+  setTimeout(() => {
+    statusBox.classList.remove("warning");
+  }, 4000);
+
+}
+
+function playAlarm() {
+
+  try {
+
+    const audio = new AudioContext();
+    const oscillator = audio.createOscillator();
+    const gain = audio.createGain();
+
+    oscillator.connect(gain);
+    gain.connect(audio.destination);
+
+    oscillator.frequency.value = 880;
+    gain.gain.value = 0.2;
+
+    oscillator.start();
+    oscillator.stop(audio.currentTime + 1);
+
+  } catch(error) {
+    console.log("音效無法播放", error);
+  }
+}
+
+function updateEvents() {
+
+  const box = document.getElementById("events");
+
+  box.innerHTML = "";
+
+  events.forEach(event => {
+
+    const div = document.createElement("p");
+    div.textContent = event.time + " - " + event.message;
+    box.appendChild(div);
+
+  });
+
+}
+
+function exportCSV() {
+
+  let csv = "時間,事件\n";
+
+  events.forEach(event => {
+    csv += `"${event.time}","${event.message}"\n`;
+  });
+
+  const blob = new Blob(
+    ["\uFEFF" + csv],
+    { type: "text/csv;charset=utf-8;" }
+  );
+
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+
+  link.href = url;
+  link.download = "老人防跌監測紀錄.csv";
+  link.click();
+
+  URL.revokeObjectURL(url);
+}
+
+function stopCamera() {
+
+  if (stream) {
+    stream.getTracks().forEach(track => track.stop());
+    stream = null;
+  }
+
+  video.srcObject = null;
+}
+
+function stopSystem() {
+
+  running = false;
+
+  if (animationId) {
+    cancelAnimationFrame(animationId);
+    animationId = null;
+  }
+
+  stopCamera();
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  fallStart = null;
+
+  statusBox.textContent = "監測已停止";
+
+}
+
+async function switchCamera() {
+
+  const wasRunning = running;
+
+  stopSystem();
+
+  cameraMode =
+    cameraMode === "environment" ? "user" : "environment";
+
+  if (wasRunning) {
+    await startSystem();
+  }
+
+}
+
+window.startSystem = startSystem;
+window.stopSystem = stopSystem;
+window.switchCamera = switchCamera;
+window.exportCSV = exportCSV;
+
+</script>
+
+</body>
+</html>
